@@ -1,0 +1,78 @@
+version: 2
+
+project_name: djaploy
+
+before:
+  hooks:
+    - go mod tidy
+    - go test ./...
+
+builds:
+  - main: ./cmd/djaploy
+    binary: djaploy
+    env:
+      - CGO_ENABLED=0
+    ldflags:
+      - -s -w -X github.com/slime4ik/djaploy-cli/internal/cli.Version={{ .Version }}
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ignore:
+      # Windows на arm64 нам не нужен: локальный режим там всё равно недоступен,
+      # а для --remote хватает amd64.
+      - goos: windows
+        goarch: arm64
+
+archives:
+  # Имя должно совпадать с тем, что ищет `djaploy update` в internal/cli/update.go.
+  # tar.gz для всех платформ, включая Windows, чтобы распаковка была одна.
+  - formats: [tar.gz]
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - README.md
+      - README.ru.md
+      - LICENSE
+
+checksum:
+  # `djaploy update` откажется обновляться, если этого файла нет в релизе.
+  name_template: checksums.txt
+
+changelog:
+  # Список коммитов в release notes не нужен: он есть в истории репозитория.
+  # На странице релиза полезнее сразу увидеть, как ставить.
+  disable: true
+
+release:
+  draft: false
+  prerelease: auto
+  header: |
+    ## Установка
+
+    ```sh
+    curl -fsSL https://raw.githubusercontent.com/slime4ik/djaploy-cli/main/install.sh | sh
+    ```
+
+    Скрипт сам определит платформу, скачает бинарь и сверит его sha256
+    с `checksums.txt` ниже. Прочитать скрипт перед запуском:
+    [install.sh](https://github.com/slime4ik/djaploy-cli/blob/main/install.sh).
+
+    Дальше: `djaploy setup --dry-run` покажет, что будет сделано с сервером,
+    ничего не выполняя.
+
+    ## Install
+
+    ```sh
+    curl -fsSL https://raw.githubusercontent.com/slime4ik/djaploy-cli/main/install.sh | sh
+    ```
+
+    The script detects your platform, downloads the binary and verifies its
+    sha256 against `checksums.txt` below. Then `djaploy setup --dry-run` shows
+    what it would do to the server without running anything.
+  footer: |
+    ---
+    Архивы: `linux` ставится на сервер, `darwin` и `windows` нужны только для
+    режима `--remote` (подготовка сервера по SSH с ноутбука).

@@ -1,0 +1,138 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "не отформатировано:"; echo "$unformatted"; exit 1
+          fi
+
+      - run: go vet ./...
+      - run: go test ./...
+
+      # Собираемся под все платформы релиза, чтобы сломанный build tag
+      # обнаружился здесь, а не при выпуске.
+      - name: cross-compile
+        run: |
+          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64; do
+            GOOS=${target%/*} GOARCH=${target#*/} go build -o /dev/null ./cmd/djaploy
+            echo "ok $target"
+          done
+
+      - name: shellcheck install.sh
+        run: shellcheck install.sh
+
+  # Настоящая проверка шагов: на чистой Ubuntu гоняем то, что реально уедет
+  # на серверы пользователей. Юнит-тесты этого не покрывают.
+  provision:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
+      - run: go build -o djaploy ./cmd/djaploy
+
+      # Слепок того, что мы обещали не трогать. Сверим после прогона.
+      - name: снимок до
+        run: |
+          sudo sha256sum /etc/ssh/sshd_config > /tmp/sshd.before
+          # Правила самого Docker из сравнения исключаем: настройка Docker
+          # означает его перезапуск, а на старте он всегда перестраивает свои
+          # цепочки (DOCKER, DOCKER-USER, MASQUERADE на docker0). Обещание
+          # касается ЧУЖИХ правил, а не тех, которыми Docker владеет сам.
+          sudo iptables-save | grep -vi docker | sudo tee /tmp/iptables.before >/dev/null
+          echo "правил не-docker до прогона: $(grep -c '^-A' /tmp/iptables.before || true)"
+          (sudo ufw status 2>/dev/null || echo "ufw не установлен") | head -1 > /tmp/ufw.before
+          cat /tmp/ufw.before
+
+      - name: base + docker
+        run: sudo ./djaploy setup --only base,docker --yes --lang en
+
+      - name: nonroot
+        run: sudo ./djaploy setup --only nonroot --yes --pubkey "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExampleKeyForCI ci@example"
+
+      - name: состояние записалось
+        run: |
+          ./djaploy status --lang en
+          sudo test -f /etc/djaploy/state.json
+          grep -q '"docker": true' /etc/djaploy/state.json
+          grep -q '"fail2ban": true' /etc/djaploy/state.json
+          grep -q '"deploy_user": "deploy"' /etc/djaploy/state.json
+
+      - name: шаги идемпотентны, второй прогон не ломается
+        run: sudo ./djaploy setup --only base,docker,nonroot --yes --lang en
+
+      - name: всё что ставили, работает
+        run: |
+          # Демон, а не только клиент: `docker compose version` отвечает и при
+          # мёртвом демоне, то есть сломанный daemon.json так не поймать.
+          # А сломанный daemon.json на сервере юзера это все контейнеры лежат.
+          # после restart демон поднимается не мгновенно, даём ему время
+          for i in $(seq 1 15); do
+            sudo docker info >/dev/null 2>&1 && break
+            [ "$i" = 15 ] && { echo "ПРОВАЛ: демон docker не поднялся"; sudo journalctl -u docker -n 30 --no-pager; exit 1; }
+            sleep 2
+          done
+          sudo systemctl is-active --quiet docker
+          sudo docker compose version
+          sudo grep -q registry-mirrors /etc/docker/daemon.json
+          sudo systemctl is-active --quiet fail2ban
+          id deploy | grep -q docker
+
+      # Главное в этой джобе. Не "сервер жив", а "мы не сделали того,
+      # чего обещали не делать".
+      - name: обещания сдержаны
+        run: |
+          # sshd_config не изменился ни на байт
+          if ! sudo sha256sum -c /tmp/sshd.before --status; then
+            echo "ПРОВАЛ: sshd_config изменился"
+            sudo sha256sum /etc/ssh/sshd_config
+            exit 1
+          fi
+          echo "ok: sshd_config не тронут"
+
+          # ufw не включали: состояние такое же, как было до прогона
+          (sudo ufw status 2>/dev/null || echo "ufw не установлен") | head -1 > /tmp/ufw.after
+          if ! diff -q /tmp/ufw.before /tmp/ufw.after >/dev/null; then
+            echo "ПРОВАЛ: состояние ufw изменилось"
+            diff /tmp/ufw.before /tmp/ufw.after || true
+            exit 1
+          fi
+          echo "ok: ufw как был ($(cat /tmp/ufw.after))"
+
+          # Чужие правила iptables на месте. Сравниваем только не-docker:
+          # см. комментарий в шаге "снимок до".
+          sudo iptables-save | grep -vi docker > /tmp/iptables.after
+          missing=0
+          while read -r rule; do
+            case "$rule" in
+              -A*) grep -qF -- "$rule" /tmp/iptables.after || {
+                     echo "ПРОВАЛ: пропало правило iptables: $rule"; missing=1; } ;;
+            esac
+          done < /tmp/iptables.before
+          [ "$missing" = 0 ] || { diff /tmp/iptables.before /tmp/iptables.after || true; exit 1; }
+          echo "ok: чужие правила iptables на месте"
+
+      - name: uninstall убирает только своё
+        run: |
+          sudo ./djaploy uninstall --yes --lang en
+          sudo test ! -e /etc/djaploy
+          sudo docker info >/dev/null
+          id deploy
+          echo "ok: снесли только своё"
